@@ -9,7 +9,7 @@ import (
 
 func TestPoolDefaults(t *testing.T) {
 	got := Config{DSN: "postgres://localhost/app"}.pool()
-	want := poolSettings{maxOpen: DefaultMaxOpenConns, maxLifetime: 10 * time.Minute}
+	want := poolSettings{maxOpen: DefaultMaxOpenConns, maxIdle: DefaultMaxOpenConns, maxLifetime: 10 * time.Minute}
 	if got != want {
 		t.Fatalf("pool() = %+v, want %+v", got, want)
 	}
@@ -18,8 +18,8 @@ func TestPoolDefaults(t *testing.T) {
 func TestPoolMaxOpenConns(t *testing.T) {
 	for _, n := range []int{1, 20, 50} {
 		got := Config{MaxOpenConns: n}.pool()
-		if got.maxOpen != n {
-			t.Errorf("MaxOpenConns=%d: got open=%d", n, got.maxOpen)
+		if got.maxOpen != n || got.maxIdle != n {
+			t.Errorf("MaxOpenConns=%d: got open=%d idle=%d", n, got.maxOpen, got.maxIdle)
 		}
 	}
 }

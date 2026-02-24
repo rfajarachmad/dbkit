@@ -41,6 +41,9 @@ type Config struct {
 	// wrapped with tracing. Empty means DefaultDriverName.
 	DriverName string
 
+	// SkipWarmUp stops Open from opening every connection up front.
+	SkipWarmUp bool
+
 	// Logger receives pool lifecycle messages. Nil means slog.Default().
 	Logger *slog.Logger
 }
@@ -48,6 +51,7 @@ type Config struct {
 // poolSettings are the database/sql pool limits derived from a Config.
 type poolSettings struct {
 	maxOpen     int
+	maxIdle     int
 	maxLifetime time.Duration
 }
 
@@ -56,16 +60,19 @@ func (c Config) pool() poolSettings {
 	if n <= 0 {
 		n = DefaultMaxOpenConns
 	}
-	return poolSettings{maxOpen: n, maxLifetime: connMaxLifetime}
+	// Keep every open connection idle-able: with the database/sql default of
+	// two idle connections the pool churns connections under steady load.
+	return poolSettings{maxOpen: n, maxIdle: n, maxLifetime: connMaxLifetime}
 }
 
 func (p poolSettings) apply(db *sql.DB) {
 	db.SetMaxOpenConns(p.maxOpen)
+	db.SetMaxIdleConns(p.maxIdle)
 	db.SetConnMaxLifetime(p.maxLifetime)
 }
 
-// Open creates a connection pool, applies the pool settings and checks that
-// the database is reachable.
+// Open creates a connection pool, applies the pool settings and, unless
+// SkipWarmUp is set, opens MaxOpenConns connections before returning.
 func Open(ctx context.Context, cfg Config) (*sql.DB, error) {
 	if cfg.DSN == "" {
 		return nil, ErrEmptyDSN
@@ -86,7 +93,14 @@ func Open(ctx context.Context, cfg Config) (*sql.DB, error) {
 	p := cfg.pool()
 	p.apply(db)
 
-	if err := db.PingContext(ctx); err != nil {
+	if !cfg.SkipWarmUp {
+		start := time.Now()
+		if err := warmUp(ctx, db, p.maxOpen); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("dbkit: warm up: %w", err)
+		}
+		logger.Info("database pool warmed", "conns", p.maxOpen, "took", time.Since(start).Round(time.Millisecond))
+	} else if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("dbkit: ping: %w", err)
 	}
@@ -104,4 +118,26 @@ func MustOpen(ctx context.Context, cfg Config) *sql.DB {
 		panic(err)
 	}
 	return db
+}
+
+// warmUp checks out n connections at once, pings each, then returns them
+// to the pool so the first requests don't pay for connection setup.
+func warmUp(ctx context.Context, db *sql.DB, n int) error {
+	conns := make([]*sql.Conn, 0, n)
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+	for range n {
+		c, err := db.Conn(ctx)
+		if err != nil {
+			return err
+		}
+		conns = append(conns, c)
+		if err := c.PingContext(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }

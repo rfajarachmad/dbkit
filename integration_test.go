@@ -18,7 +18,7 @@ func testDSN(t *testing.T) string {
 	return dsn
 }
 
-func TestOpen(t *testing.T) {
+func TestOpenWarmsPool(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -28,11 +28,48 @@ func TestOpen(t *testing.T) {
 	}
 	defer db.Close()
 
-	if s := db.Stats(); s.MaxOpenConnections != 5 || s.OpenConnections != 1 {
-		t.Errorf("MaxOpenConnections=%d OpenConnections=%d, want 5 and 1", s.MaxOpenConnections, s.OpenConnections)
+	s := db.Stats()
+	if s.MaxOpenConnections != 5 {
+		t.Errorf("MaxOpenConnections = %d, want 5", s.MaxOpenConnections)
 	}
-	var one int
-	if err := db.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil || one != 1 {
-		t.Fatalf("SELECT 1: %d, %v", one, err)
+	if s.OpenConnections != 5 || s.Idle != 5 {
+		t.Errorf("after warm up: open=%d idle=%d, want 5 and 5", s.OpenConnections, s.Idle)
+	}
+}
+
+func TestOpenSkipWarmUp(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	db, err := Open(ctx, Config{DSN: testDSN(t), MaxOpenConns: 5, SkipWarmUp: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if got := db.Stats().OpenConnections; got != 1 {
+		t.Errorf("OpenConnections = %d, want 1", got)
+	}
+}
+
+func TestQueriesKeepConnectionsOpen(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	db, err := Open(ctx, Config{DSN: testDSN(t), MaxOpenConns: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	for range 50 {
+		var one int
+		if err := db.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := db.Stats()
+	if s.OpenConnections != 3 || s.MaxIdleClosed != 0 {
+		t.Errorf("open=%d maxIdleClosed=%d, want 3 and 0", s.OpenConnections, s.MaxIdleClosed)
 	}
 }

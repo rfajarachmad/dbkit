@@ -1,8 +1,8 @@
 # dbkit
 
 Shared PostgreSQL connection helper for Go services. It opens a `database/sql`
-pool on the [pgx](https://github.com/jackc/pgx) driver and applies the pool
-settings our services share.
+pool on the [pgx](https://github.com/jackc/pgx) driver, applies the pool
+settings our services share and warms the pool on start.
 
 ## Install
 
