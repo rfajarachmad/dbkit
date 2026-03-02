@@ -4,6 +4,17 @@ All notable changes to this module are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the module uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-03-02
+
+### Added
+- Warm pool on start: `Open` opens `MaxOpenConns` connections before it returns,
+  so the first requests after a deploy don't pay for connection setup.
+- `Config.SkipWarmUp` to turn warm-up off, for CLIs and migrations.
+
+### Changed
+- Idle connection limit now equals `MaxOpenConns`. The `database/sql` default of
+  two idle connections closed and reopened connections under steady load.
+
 ## [1.2.1] - 2025-11-18
 
 ### Fixed
