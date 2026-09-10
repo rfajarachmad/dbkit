@@ -1,7 +1,11 @@
 // Package dbkit opens PostgreSQL connection pools for Go services.
 //
-// It wraps database/sql with the pgx driver and applies the pool settings
-// our services share, so each service doesn't tune them on its own.
+// It wraps database/sql with the pgx driver. Pool settings come from the DSN,
+// so a service can be retuned through its connection string alone:
+//
+//	postgres://app@db:5432/app?sslmode=require&max_conns=20&max_conn_lifetime=30m
+//
+// See ParseDSN for the supported parameters.
 package dbkit
 
 import (
@@ -15,129 +19,85 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" driver
 )
 
-const (
-	// DefaultMaxOpenConns is used when Config.MaxOpenConns is zero.
-	DefaultMaxOpenConns = 10
+// DefaultDriverName is the database/sql driver registered by pgx.
+const DefaultDriverName = "pgx"
 
-	// DefaultDriverName is the database/sql driver registered by pgx.
-	DefaultDriverName = "pgx"
-
-	connMaxLifetime = 10 * time.Minute
-)
-
-// ErrEmptyDSN is returned by Open when Config.DSN is empty.
+// ErrEmptyDSN is returned by Open when the DSN is empty.
 var ErrEmptyDSN = errors.New("dbkit: empty DSN")
 
-// Config describes a connection pool.
-type Config struct {
-	// DSN is a PostgreSQL connection string in URL or keyword/value form.
-	DSN string
-
-	// MaxOpenConns limits the number of open connections.
-	// Zero means DefaultMaxOpenConns.
-	MaxOpenConns int
-
-	// DriverName selects a registered database/sql driver, for example one
-	// wrapped with tracing. Empty means DefaultDriverName.
-	DriverName string
-
-	// SkipWarmUp stops Open from opening every connection up front.
-	SkipWarmUp bool
-
-	// Logger receives pool lifecycle messages. Nil means slog.Default().
-	Logger *slog.Logger
+type options struct {
+	driverName string
+	logger     *slog.Logger
+	maxConns   int
+	warmUp     *bool
 }
 
-// poolSettings are the database/sql pool limits derived from a Config.
-type poolSettings struct {
-	maxOpen     int
-	maxIdle     int
-	maxLifetime time.Duration
+// Option customises Open.
+type Option func(*options)
+
+// WithDriverName selects a registered database/sql driver, for example one
+// wrapped with tracing.
+func WithDriverName(name string) Option {
+	return func(o *options) { o.driverName = name }
 }
 
-func (c Config) pool() poolSettings {
-	n := c.MaxOpenConns
-	if n <= 0 {
-		n = DefaultMaxOpenConns
-	}
-	// Keep every open connection idle-able: with the database/sql default of
-	// two idle connections the pool churns connections under steady load.
-	return poolSettings{maxOpen: n, maxIdle: n, maxLifetime: connMaxLifetime}
+// WithLogger sets the logger for pool lifecycle messages.
+func WithLogger(l *slog.Logger) Option {
+	return func(o *options) { o.logger = l }
 }
 
-func (p poolSettings) apply(db *sql.DB) {
-	db.SetMaxOpenConns(p.maxOpen)
-	db.SetMaxIdleConns(p.maxIdle)
-	db.SetConnMaxLifetime(p.maxLifetime)
+// WithMaxConns sets the maximum number of open connections. It takes
+// precedence over max_conns in the DSN.
+func WithMaxConns(n int) Option {
+	return func(o *options) { o.maxConns = n }
 }
 
-// Open creates a connection pool, applies the pool settings and, unless
-// SkipWarmUp is set, opens MaxOpenConns connections before returning.
-func Open(ctx context.Context, cfg Config) (*sql.DB, error) {
-	if cfg.DSN == "" {
+// WithWarmUp turns warm-up on or off. It takes precedence over warm_pool in
+// the DSN.
+func WithWarmUp(enabled bool) Option {
+	return func(o *options) { o.warmUp = &enabled }
+}
+
+// Open creates a connection pool from dsn, applies its pool settings and,
+// unless warm-up is off, opens every connection before returning.
+func Open(ctx context.Context, dsn string, opts ...Option) (*sql.DB, error) {
+	if dsn == "" {
 		return nil, ErrEmptyDSN
 	}
-	driver := cfg.DriverName
-	if driver == "" {
-		driver = DefaultDriverName
-	}
-	logger := cfg.Logger
-	if logger == nil {
-		logger = slog.Default()
+	o := options{driverName: DefaultDriverName, logger: slog.Default()}
+	for _, opt := range opts {
+		opt(&o)
 	}
 
-	db, err := sql.Open(driver, cfg.DSN)
+	pc, connString, err := ParseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	if o.maxConns > 0 {
+		pc.MaxConns = o.maxConns
+	}
+	if o.warmUp != nil {
+		pc.WarmPool = *o.warmUp
+	}
+
+	db, err := sql.Open(o.driverName, connString)
 	if err != nil {
 		return nil, fmt.Errorf("dbkit: open: %w", err)
 	}
-	p := cfg.pool()
-	p.apply(db)
+	pc.apply(db)
 
-	if !cfg.SkipWarmUp {
+	if pc.WarmPool {
 		start := time.Now()
-		if err := warmUp(ctx, db, p.maxOpen); err != nil {
+		if err := warmUp(ctx, db, pc.MaxConns); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("dbkit: warm up: %w", err)
 		}
-		logger.Info("database pool warmed", "conns", p.maxOpen, "took", time.Since(start).Round(time.Millisecond))
+		o.logger.Info("database pool warmed", "conns", pc.MaxConns, "took", time.Since(start).Round(time.Millisecond))
 	} else if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("dbkit: ping: %w", err)
 	}
 
-	logger.Info("database pool ready", "max_open_conns", p.maxOpen)
+	o.logger.Info("database pool ready", "max_open_conns", pc.MaxConns, "dsn", Redact(connString))
 	return db, nil
-}
-
-// MustOpen is like Open but panics on error.
-//
-// Deprecated: use Open and handle the error.
-func MustOpen(ctx context.Context, cfg Config) *sql.DB {
-	db, err := Open(ctx, cfg)
-	if err != nil {
-		panic(err)
-	}
-	return db
-}
-
-// warmUp checks out n connections at once, pings each, then returns them
-// to the pool so the first requests don't pay for connection setup.
-func warmUp(ctx context.Context, db *sql.DB, n int) error {
-	conns := make([]*sql.Conn, 0, n)
-	defer func() {
-		for _, c := range conns {
-			c.Close()
-		}
-	}()
-	for range n {
-		c, err := db.Conn(ctx)
-		if err != nil {
-			return err
-		}
-		conns = append(conns, c)
-		if err := c.PingContext(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
 }

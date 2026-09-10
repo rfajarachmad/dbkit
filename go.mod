@@ -1,6 +1,6 @@
-module github.com/rfajarachmad/dbkit
+module github.com/rfajarachmad/dbkit/v2
 
-go 1.26
+go 1.27
 
 require github.com/jackc/pgx/v5 v5.11.0
 
